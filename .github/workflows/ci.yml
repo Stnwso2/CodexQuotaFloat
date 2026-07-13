@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Build with analyzers
+        run: dotnet build --configuration Release /p:EnableNETAnalyzers=true /p:AnalysisLevel=latest /warnaserror
+
+      - name: Verify self-contained publish
+        run: dotnet publish --configuration Release --runtime win-x64 --self-contained true --no-restore --output publish
