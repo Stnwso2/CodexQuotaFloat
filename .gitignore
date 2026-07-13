@@ -1,0 +1,22 @@
+bin/
+obj/
+publish/
+release/
+.vs/
+*.user
+*.suo
+*.zip
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+auth.json
+.codex/
+secrets.json
+*.pfx
+*.p12
+*.snk
+*.key
+*.pem
+
