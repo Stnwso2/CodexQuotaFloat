@@ -29,13 +29,7 @@ internal sealed class QuotaApplicationContext : ApplicationContext
     private readonly NotifyIcon _trayIcon;
     private readonly System.Windows.Forms.Timer _lifecycleTimer = new() { Interval = 1500 };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 30_000 };
-    private readonly HttpClient _http = new(new HttpClientHandler
-    {
-        AllowAutoRedirect = false
-    })
-    {
-        Timeout = TimeSpan.FromSeconds(12)
-    };
+    private readonly HttpClient _http = NetworkClientFactory.Create();
     private ToolStripMenuItem? _topMostMenuItem;
     private bool _refreshing;
     private bool _codexRunning;
@@ -267,10 +261,10 @@ internal sealed class QuotaApplicationContext : ApplicationContext
         {
             try
             {
-                using var request = new HttpRequestMessage(HttpMethod.Get, "https://chatgpt.com/backend-api/wham/usage");
+                using var request = new HttpRequestMessage(HttpMethod.Get, NetworkClientFactory.UsageEndpoint);
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
                 request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", accountId);
-                request.Headers.UserAgent.ParseAdd("codex-quota-float/0.3.2");
+                request.Headers.UserAgent.ParseAdd("codex-quota-float/0.3.3");
 
                 var response = await _http.SendAsync(request);
                 var shouldRetry = response.StatusCode == HttpStatusCode.TooManyRequests ||

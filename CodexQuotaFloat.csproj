@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>CodexQuotaFloat</AssemblyName>
     <RootNamespace>CodexQuotaFloat</RootNamespace>
-    <Version>0.3.2</Version>
+    <Version>0.3.3</Version>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
