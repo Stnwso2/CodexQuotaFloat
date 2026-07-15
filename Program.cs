@@ -29,7 +29,7 @@ internal sealed class QuotaApplicationContext : ApplicationContext
     private readonly NotifyIcon _trayIcon;
     private readonly System.Windows.Forms.Timer _lifecycleTimer = new() { Interval = 1500 };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 30_000 };
-    private readonly HttpClient _http = NetworkClientFactory.Create();
+    private HttpClient _http = NetworkClientFactory.Create();
     private ToolStripMenuItem? _topMostMenuItem;
     private bool _refreshing;
     private bool _codexRunning;
@@ -264,7 +264,7 @@ internal sealed class QuotaApplicationContext : ApplicationContext
                 using var request = new HttpRequestMessage(HttpMethod.Get, NetworkClientFactory.UsageEndpoint);
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
                 request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", accountId);
-                request.Headers.UserAgent.ParseAdd("codex-quota-float/0.3.3");
+                request.Headers.UserAgent.ParseAdd("codex-quota-float/0.3.4");
 
                 var response = await _http.SendAsync(request);
                 var shouldRetry = response.StatusCode == HttpStatusCode.TooManyRequests ||
@@ -279,6 +279,7 @@ internal sealed class QuotaApplicationContext : ApplicationContext
             catch (Exception error) when (error is HttpRequestException or TaskCanceledException)
             {
                 lastError = error;
+                ResetHttpClient();
                 if (attempt == 2) throw;
             }
 
@@ -286,6 +287,13 @@ internal sealed class QuotaApplicationContext : ApplicationContext
         }
 
         throw lastError ?? new HttpRequestException("Codex usage request failed.");
+    }
+
+    private void ResetHttpClient()
+    {
+        var previous = _http;
+        _http = NetworkClientFactory.Create();
+        previous.Dispose();
     }
 
     private void ReportRefreshFailure(string firstLoadMessage)
