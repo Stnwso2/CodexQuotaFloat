@@ -41,7 +41,7 @@ internal sealed class QuotaApplicationContext : ApplicationContext
     {
         _trayIcon = new NotifyIcon
         {
-            Icon = IconFactory.Create(),
+            Icon = IconFactory.Create(SystemInformation.SmallIconSize),
             Text = "Codex 额度悬浮窗（等待 Codex）",
             Visible = true,
             ContextMenuStrip = BuildMenu()
@@ -559,6 +559,7 @@ internal sealed class QuotaForm : Form
         MinimizeBox = false;
         Opacity = 0.99;
         ShowInTaskbar = false;
+        Icon = IconFactory.Create(new Size(32, 32));
         StartPosition = FormStartPosition.Manual;
         TopMost = false;
         DoubleBuffered = true;
@@ -1062,20 +1063,73 @@ internal sealed class DarkColorTable : ProfessionalColorTable
 
 internal static class IconFactory
 {
-    public static Icon Create()
+    private const string ResourceName = "CodexQuotaFloat.Assets.CodexQuotaFloat.ico";
+
+    public static Icon Create(Size size)
     {
-        using var bitmap = new Bitmap(32, 32);
+        try
+        {
+            using var stream = typeof(IconFactory).Assembly.GetManifestResourceStream(ResourceName);
+            if (stream is not null)
+            {
+                using var source = new Icon(stream, size);
+                return (Icon)source.Clone();
+            }
+        }
+        catch (ArgumentException)
+        {
+            // Keep the tray usable even if a future package loses the embedded icon.
+        }
+
+        return CreateFallback(size);
+    }
+
+    private static Icon CreateFallback(Size size)
+    {
+        var edge = Math.Max(16, Math.Max(size.Width, size.Height));
+        using var bitmap = new Bitmap(edge, edge);
         using var graphics = Graphics.FromImage(bitmap);
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         graphics.Clear(Color.Transparent);
-        using var background = new SolidBrush(Color.FromArgb(25, 30, 41));
-        graphics.FillEllipse(background, 1, 1, 30, 30);
-        using var pen = new Pen(Color.FromArgb(94, 229, 198), 3.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
-        graphics.DrawLine(pen, 10, 10, 22, 22);
-        graphics.DrawLine(pen, 22, 10, 10, 22);
+        var scale = edge / 32f;
+        using var paper = new SolidBrush(Color.FromArgb(249, 247, 238));
+        using var gold = new Pen(Color.FromArgb(180, 137, 66), Math.Max(1.5f, 2.2f * scale));
+        using var ink = new Pen(Color.FromArgb(39, 38, 33), Math.Max(1.5f, 2.4f * scale))
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
+            LineJoin = LineJoin.Round
+        };
+        using var seal = new SolidBrush(Color.FromArgb(184, 67, 48));
+        var inset = 2f * scale;
+        using var card = RoundedRectangle(new RectangleF(inset, inset, edge - inset * 2, edge - inset * 2), 6f * scale);
+        graphics.FillPath(paper, card);
+        graphics.DrawPath(gold, card);
+
+        PointF P(float x, float y) => new(x * scale, y * scale);
+        graphics.DrawLines(ink, [P(8, 12), P(16, 6), P(24, 12)]);
+        graphics.DrawLine(ink, P(10, 14), P(22, 14));
+        graphics.DrawLine(ink, P(12, 18), P(20, 18));
+        graphics.DrawLine(ink, P(16, 14), P(16, 25));
+        graphics.DrawLine(ink, P(16, 20), P(10, 25));
+        graphics.DrawLine(ink, P(16, 20), P(21, 24));
+        graphics.FillRectangle(seal, 22f * scale, 22f * scale, 6f * scale, 6f * scale);
+
         var handle = bitmap.GetHicon();
         try { return (Icon)Icon.FromHandle(handle).Clone(); }
         finally { NativeMethods.DestroyIcon(handle); }
+    }
+
+    private static GraphicsPath RoundedRectangle(RectangleF bounds, float radius)
+    {
+        var diameter = radius * 2;
+        var path = new GraphicsPath();
+        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        return path;
     }
 }
 
