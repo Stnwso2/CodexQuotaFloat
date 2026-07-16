@@ -1092,28 +1092,42 @@ internal static class IconFactory
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         graphics.Clear(Color.Transparent);
         var scale = edge / 32f;
-        using var paper = new SolidBrush(Color.FromArgb(249, 247, 238));
-        using var gold = new Pen(Color.FromArgb(180, 137, 66), Math.Max(1.5f, 2.2f * scale));
-        using var ink = new Pen(Color.FromArgb(39, 38, 33), Math.Max(1.5f, 2.4f * scale))
+        var inset = 2f * scale;
+        var cardBounds = new RectangleF(inset, inset, edge - inset * 2, edge - inset * 2);
+        using var card = RoundedRectangle(cardBounds, 7.5f * scale);
+        using var ink = new LinearGradientBrush(
+            cardBounds,
+            Color.FromArgb(55, 54, 48),
+            Color.FromArgb(22, 23, 22),
+            135f);
+        graphics.FillPath(ink, card);
+
+        using var fanGold = new SolidBrush(Color.FromArgb(224, 184, 98));
+        graphics.FillPie(fanGold, 4.48f * scale, 5.76f * scale, 23.04f * scale, 23.04f * scale, 202, 136);
+        using var fanPaper = new SolidBrush(Color.FromArgb(247, 231, 193));
+        graphics.FillPie(fanPaper, 6.4f * scale, 7.68f * scale, 19.2f * scale, 19.2f * scale, 205, 130);
+        using var redLeaf = new SolidBrush(Color.FromArgb(182, 57, 43));
+        graphics.FillPie(redLeaf, 8.32f * scale, 9.6f * scale, 15.36f * scale, 15.36f * scale, 248, 44);
+
+        using var ribs = new Pen(Color.FromArgb(123, 74, 40), Math.Max(1f, 0.86f * scale))
         {
             StartCap = LineCap.Round,
-            EndCap = LineCap.Round,
-            LineJoin = LineJoin.Round
+            EndCap = LineCap.Round
         };
-        using var seal = new SolidBrush(Color.FromArgb(184, 67, 48));
-        var inset = 2f * scale;
-        using var card = RoundedRectangle(new RectangleF(inset, inset, edge - inset * 2, edge - inset * 2), 6f * scale);
-        graphics.FillPath(paper, card);
-        graphics.DrawPath(gold, card);
-
-        PointF P(float x, float y) => new(x * scale, y * scale);
-        graphics.DrawLines(ink, [P(8, 12), P(16, 6), P(24, 12)]);
-        graphics.DrawLine(ink, P(10, 14), P(22, 14));
-        graphics.DrawLine(ink, P(12, 18), P(20, 18));
-        graphics.DrawLine(ink, P(16, 14), P(16, 25));
-        graphics.DrawLine(ink, P(16, 20), P(10, 25));
-        graphics.DrawLine(ink, P(16, 20), P(21, 24));
-        graphics.FillRectangle(seal, 22f * scale, 22f * scale, 6f * scale, 6f * scale);
+        var pivot = new PointF(16f * scale, 23.36f * scale);
+        foreach (var target in new[]
+        {
+            new PointF(6.72f * scale, 16f * scale),
+            new PointF(10.24f * scale, 10.88f * scale),
+            new PointF(16f * scale, 8.96f * scale),
+            new PointF(21.76f * scale, 10.88f * scale),
+            new PointF(25.28f * scale, 16f * scale)
+        })
+        {
+            graphics.DrawLine(ribs, pivot, target);
+        }
+        using var pin = new SolidBrush(Color.FromArgb(235, 195, 107));
+        graphics.FillEllipse(pin, 14.08f * scale, 21.44f * scale, 3.84f * scale, 3.84f * scale);
 
         var handle = bitmap.GetHicon();
         try { return (Icon)Icon.FromHandle(handle).Clone(); }
