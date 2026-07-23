@@ -25,17 +25,27 @@ internal static class Program
 
 internal sealed class QuotaApplicationContext : ApplicationContext
 {
+    // Process enumeration can briefly miss Store/Electron helper processes while the desktop app
+    // is rebuilding its window. Do not hide the float based on a single transient observation.
+    private const int MissingCodexChecksBeforeHiding = 4;
     private readonly QuotaForm _form = new();
+    private readonly SkinController _skin = new();
     private readonly NotifyIcon _trayIcon;
     private readonly System.Windows.Forms.Timer _lifecycleTimer = new() { Interval = 1500 };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 30_000 };
     private HttpClient _http = NetworkClientFactory.Create();
     private ToolStripMenuItem? _topMostMenuItem;
+    private ToolStripMenuItem? _skinStatusMenuItem;
+    private ToolStripMenuItem? _skinEnableMenuItem;
+    private ToolStripMenuItem? _skinReloadMenuItem;
+    private ToolStripMenuItem? _skinRestoreMenuItem;
     private bool _refreshing;
+    private bool _skinCommandRunning;
     private bool _codexRunning;
     private bool _hasSuccessfulQuota;
     private int _notRunningChecks;
     private int _consecutiveRefreshFailures;
+    private bool _skillsRefreshing;
 
     public QuotaApplicationContext()
     {
@@ -57,6 +67,13 @@ internal sealed class QuotaApplicationContext : ApplicationContext
         };
 
         _form.RefreshRequested += (_, _) => _ = RefreshQuotaAsync();
+        _form.SkinActionRequested += (_, _) => _ = RunPrimarySkinActionAsync();
+        _form.SkillsToggleRequested += (_, _) =>
+        {
+            var expanded = _form.ToggleSkillsPanel();
+            if (expanded) _ = RefreshSkillsAsync();
+            DockToCodex();
+        };
         _form.MenuRequested += (_, _) => _trayIcon.ContextMenuStrip?.Show(Cursor.Position);
         _form.AlwaysOnTopChanged += enabled =>
         {
@@ -85,6 +102,24 @@ internal sealed class QuotaApplicationContext : ApplicationContext
             ForeColor = Color.FromArgb(55, 54, 49)
         };
         menu.Items.Add("立即刷新", null, (_, _) => _ = RefreshQuotaAsync());
+        menu.Items.Add("显示可用 Skills", null, (_, _) => _ = ShowSkillsPanelAsync());
+
+        var skinMenu = new ToolStripMenuItem("界面皮肤");
+        _skinStatusMenuItem = new ToolStripMenuItem("状态：检查中…") { Enabled = false };
+        _skinEnableMenuItem = new ToolStripMenuItem("启用皮肤（Codex 重启一次）");
+        _skinEnableMenuItem.Click += (_, _) => _ = RunSkinCommandAsync(SkinCommand.Enable);
+        _skinReloadMenuItem = new ToolStripMenuItem("热加载样式");
+        _skinReloadMenuItem.Click += (_, _) => _ = RunSkinCommandAsync(SkinCommand.HotReload);
+        _skinRestoreMenuItem = new ToolStripMenuItem("恢复官方样式");
+        _skinRestoreMenuItem.Click += (_, _) => _ = RunSkinCommandAsync(SkinCommand.Restore);
+        skinMenu.DropDownItems.AddRange([
+            _skinStatusMenuItem,
+            new ToolStripSeparator(),
+            _skinEnableMenuItem,
+            _skinReloadMenuItem,
+            _skinRestoreMenuItem
+        ]);
+        menu.Items.Add(skinMenu);
 
         _topMostMenuItem = new ToolStripMenuItem("保持最前") { Checked = false, CheckOnClick = true };
         _topMostMenuItem.CheckedChanged += (_, _) => _form.SetAlwaysOnTop(_topMostMenuItem.Checked);
@@ -101,6 +136,7 @@ internal sealed class QuotaApplicationContext : ApplicationContext
 
     private void CheckCodexLifecycle()
     {
+        UpdateSkinUi();
         var state = CodexLocator.Find();
         if (state.Running)
         {
@@ -108,35 +144,149 @@ internal sealed class QuotaApplicationContext : ApplicationContext
             if (!_codexRunning)
             {
                 _codexRunning = true;
+                UpdateSkinUi();
                 _trayIcon.Text = "Codex 额度悬浮窗（自动更新中）";
                 _form.SetWaiting("正在读取当前账户额度…");
                 _form.Show();
                 _ = RefreshQuotaAsync();
             }
 
-            if (_form.Visible && state.WindowHandle != IntPtr.Zero)
+            // An owned WinForms window is hidden by Windows when the Codex owner is minimized.
+            // It can remain hidden after the owner is restored or recreated because the lifecycle
+            // state still says "running". Reassert the visible state whenever the Codex window is
+            // usable; this is UI recovery only and never starts or restarts Codex.
+            if (state.ShouldShowFloat)
             {
-                _form.AttachToCodexWindow(state.WindowHandle);
+                if (!_form.Visible)
+                {
+                    _form.Show();
+                }
+            }
+            else if (_form.Visible)
+            {
+                _form.Hide();
+            }
+
+            if (_form.Visible && state.CodexWindowHandle != IntPtr.Zero)
+            {
+                _form.AttachToCodexWindow(state.CodexWindowHandle);
+            }
+            else
+            {
+                _form.DetachFromCodexWindow();
             }
 
             if (_form.Visible && !_form.HasManualPositionOrIsDragging())
             {
-                DockToCodex(state.WindowHandle);
+                DockToCodex(state.DockWindowHandle);
             }
             return;
         }
 
         _notRunningChecks++;
-        if (_notRunningChecks < 2 || !_codexRunning)
+        if (_notRunningChecks < MissingCodexChecksBeforeHiding || !_codexRunning)
         {
             return;
         }
 
         _codexRunning = false;
+        UpdateSkinUi();
         _form.Hide();
         _form.DetachFromCodexWindow();
         _trayIcon.Text = "Codex 额度悬浮窗（等待 Codex）";
     }
+
+    private async Task RunPrimarySkinActionAsync()
+    {
+        var status = _skin.GetStatus();
+        if (!status.Available)
+        {
+            ShowSkinNotification(false, "未找到 Codex Dream Skin 安装组件");
+            return;
+        }
+
+        await RunSkinCommandAsync(status.IsActive ? SkinCommand.HotReload : SkinCommand.Enable);
+    }
+
+    private async Task RunSkinCommandAsync(SkinCommand command)
+    {
+        if (_skinCommandRunning) return;
+
+        var status = _skin.GetStatus();
+        if (!status.Available)
+        {
+            ShowSkinNotification(false, "未找到 Codex Dream Skin 安装组件");
+            return;
+        }
+
+        if ((command is SkinCommand.HotReload or SkinCommand.Restore) && !status.IsActive)
+        {
+            ShowSkinNotification(false, "皮肤当前未启用");
+            UpdateSkinUi(status);
+            return;
+        }
+
+        _skinCommandRunning = true;
+        UpdateSkinUi(status);
+        try
+        {
+            var result = command switch
+            {
+                SkinCommand.Enable => await _skin.EnableAsync(),
+                SkinCommand.HotReload => await _skin.HotReloadAsync(),
+                SkinCommand.Restore => await _skin.RestoreAsync(),
+                _ => new SkinCommandResult(false, "未知的皮肤操作")
+            };
+            var message = string.IsNullOrWhiteSpace(result.Details)
+                ? result.Message
+                : $"{result.Message}：{result.Details}";
+            ShowSkinNotification(result.Success, message);
+        }
+        finally
+        {
+            _skinCommandRunning = false;
+            UpdateSkinUi();
+        }
+    }
+
+    private void UpdateSkinUi(SkinStatus? knownStatus = null)
+    {
+        var status = knownStatus ?? _skin.GetStatus();
+        var label = _skinCommandRunning ? "处理中…" : status.Label;
+        _form.SetSkinState(label, status.IsActive, _skinCommandRunning);
+
+        if (_skinStatusMenuItem is not null)
+        {
+            _skinStatusMenuItem.Text = _skinCommandRunning ? "状态：处理中…" : $"状态：{StatusText(status)}";
+        }
+        if (_skinEnableMenuItem is not null)
+        {
+            _skinEnableMenuItem.Enabled = !_skinCommandRunning && status.Available && !status.IsActive && _codexRunning;
+        }
+        if (_skinReloadMenuItem is not null)
+        {
+            _skinReloadMenuItem.Enabled = !_skinCommandRunning && status.IsActive;
+        }
+        if (_skinRestoreMenuItem is not null)
+        {
+            _skinRestoreMenuItem.Enabled = !_skinCommandRunning && status.IsActive;
+        }
+    }
+
+    private void ShowSkinNotification(bool success, string message)
+    {
+        _trayIcon.BalloonTipTitle = success ? "Codex 皮肤" : "Codex 皮肤操作未完成";
+        _trayIcon.BalloonTipText = message.Length <= 240 ? message : message[..240] + "…";
+        _trayIcon.BalloonTipIcon = success ? ToolTipIcon.Info : ToolTipIcon.Warning;
+        _trayIcon.ShowBalloonTip(3500);
+    }
+
+    private static string StatusText(SkinStatus status) => status.Mode switch
+    {
+        SkinMode.Unavailable => "组件未安装",
+        SkinMode.Active => "已启用",
+        _ => "未启用"
+    };
 
     private void DockToCodex(IntPtr knownWindow = default)
     {
@@ -145,7 +295,7 @@ internal sealed class QuotaApplicationContext : ApplicationContext
             return;
         }
 
-        var window = knownWindow != IntPtr.Zero ? knownWindow : CodexLocator.Find().WindowHandle;
+        var window = knownWindow != IntPtr.Zero ? knownWindow : CodexLocator.Find().DockWindowHandle;
         Rectangle workArea;
         Rectangle codexRect;
 
@@ -232,6 +382,14 @@ internal sealed class QuotaApplicationContext : ApplicationContext
             using var usageDocument = await JsonDocument.ParseAsync(stream);
             var snapshot = QuotaParser.Parse(usageDocument.RootElement);
             _form.SetSnapshot(snapshot);
+            try
+            {
+                await WriteQuotaSnapshotAsync(snapshot);
+            }
+            catch
+            {
+                // Sharing the sanitized snapshot must never turn a successful quota refresh into a UI failure.
+            }
             _trayIcon.Text = snapshot.TooltipText;
             _hasSuccessfulQuota = true;
             _consecutiveRefreshFailures = 0;
@@ -254,6 +412,73 @@ internal sealed class QuotaApplicationContext : ApplicationContext
         }
     }
 
+    private async Task ShowSkillsPanelAsync()
+    {
+        if (!_form.SkillsExpanded)
+        {
+            _form.SetSkillsExpanded(true);
+            DockToCodex();
+        }
+
+        await RefreshSkillsAsync();
+    }
+
+    private async Task RefreshSkillsAsync()
+    {
+        if (_skillsRefreshing)
+        {
+            return;
+        }
+
+        _skillsRefreshing = true;
+        _form.SetSkillsLoading(true);
+        try
+        {
+            var snapshot = await Task.Run(SkillCatalog.Discover);
+            _form.SetSkillCatalog(snapshot);
+        }
+        catch
+        {
+            _form.SetSkillCatalog(new SkillCatalogSnapshot(DateTime.Now, Array.Empty<CodexSkill>()));
+        }
+        finally
+        {
+            _skillsRefreshing = false;
+            _form.SetSkillsLoading(false);
+        }
+    }
+
+    private static async Task WriteQuotaSnapshotAsync(QuotaSnapshot snapshot)
+    {
+        var weekly = snapshot.Windows
+            .Where(window => window.WindowSeconds >= 5 * 24 * 60 * 60)
+            .OrderByDescending(window => window.WindowSeconds)
+            .FirstOrDefault();
+        if (weekly is null)
+        {
+            return;
+        }
+
+        var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexQuotaFloat");
+        Directory.CreateDirectory(directory);
+        var target = Path.Combine(directory, "quota-snapshot.json");
+        var temporary = Path.Combine(directory, $"quota-snapshot-{Guid.NewGuid():N}.tmp");
+        var payload = new
+        {
+            schemaVersion = 1,
+            fetchedAt = snapshot.FetchedAt,
+            plan = snapshot.Plan,
+            weekly = new
+            {
+                remainingPercent = weekly.RemainingPercent,
+                windowSeconds = weekly.WindowSeconds,
+                resetAt = weekly.ResetsAt,
+            },
+        };
+        await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(payload));
+        File.Move(temporary, target, true);
+    }
+
     private async Task<HttpResponseMessage> SendUsageRequestWithRetryAsync(string accessToken, string accountId)
     {
         Exception? lastError = null;
@@ -264,7 +489,7 @@ internal sealed class QuotaApplicationContext : ApplicationContext
                 using var request = new HttpRequestMessage(HttpMethod.Get, NetworkClientFactory.UsageEndpoint);
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
                 request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", accountId);
-                request.Headers.UserAgent.ParseAdd("codex-quota-float/0.3.4");
+                request.Headers.UserAgent.ParseAdd("codex-quota-float/0.4.0");
 
                 var response = await _http.SendAsync(request);
                 var shouldRetry = response.StatusCode == HttpStatusCode.TooManyRequests ||
@@ -316,9 +541,17 @@ internal sealed class QuotaApplicationContext : ApplicationContext
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         _http.Dispose();
+        _skin.Dispose();
         _form.Dispose();
         base.ExitThreadCore();
     }
+}
+
+internal enum SkinCommand
+{
+    Enable,
+    HotReload,
+    Restore
 }
 
 internal static class CodexLocator
@@ -326,9 +559,10 @@ internal static class CodexLocator
     public static CodexState Find()
     {
         var running = false;
-        var window = IntPtr.Zero;
+        var codexWindow = IntPtr.Zero;
+        var fallbackWindow = IntPtr.Zero;
 
-        foreach (var processName in new[] { "ChatGPT", "codex" })
+        foreach (var processName in new[] { "ChatGPT", "codex", "codex-plus-plus-manager" })
         {
             Process[] processes;
             try { processes = Process.GetProcessesByName(processName); }
@@ -340,9 +574,13 @@ internal static class CodexLocator
                 {
                     try
                     {
-                        var path = process.MainModule?.FileName ?? string.Empty;
-                        if (!path.Contains("OpenAI.Codex_", StringComparison.OrdinalIgnoreCase) &&
-                            !path.Contains(@"OpenAI\Codex", StringComparison.OrdinalIgnoreCase))
+                        // Store-installed Codex can deny MainModule inspection. The exact desktop process
+                        // names are sufficient for ownership selection and let the real Codex window win.
+                        var isCodexDesktop = processName is "ChatGPT" or "codex";
+                        var path = isCodexDesktop ? string.Empty : process.MainModule?.FileName ?? string.Empty;
+                        var isCodexPlusPlus = processName == "codex-plus-plus-manager" &&
+                                               path.EndsWith(@"Codex++\codex-plus-plus-manager.exe", StringComparison.OrdinalIgnoreCase);
+                        if (!isCodexDesktop && !isCodexPlusPlus)
                         {
                             continue;
                         }
@@ -350,7 +588,14 @@ internal static class CodexLocator
                         running = true;
                         if (process.MainWindowHandle != IntPtr.Zero)
                         {
-                            window = process.MainWindowHandle;
+                            if (isCodexDesktop)
+                            {
+                                codexWindow = process.MainWindowHandle;
+                            }
+                            else if (fallbackWindow == IntPtr.Zero)
+                            {
+                                fallbackWindow = process.MainWindowHandle;
+                            }
                         }
                     }
                     catch
@@ -361,13 +606,21 @@ internal static class CodexLocator
             }
         }
 
-        return new CodexState(running, window);
+        return new CodexState(running, codexWindow, fallbackWindow);
     }
 }
 
-internal readonly record struct CodexState(bool Running, IntPtr WindowHandle);
+internal readonly record struct CodexState(bool Running, IntPtr CodexWindowHandle, IntPtr FallbackWindowHandle)
+{
+    public IntPtr DockWindowHandle => CodexWindowHandle != IntPtr.Zero ? CodexWindowHandle : FallbackWindowHandle;
 
-internal sealed record QuotaWindow(string Label, double RemainingPercent, DateTimeOffset? ResetsAt);
+    // No main window is common during app startup, so retain the prior behavior and show the
+    // float. When a window is known to be minimized or hidden, keep the float hidden with Codex.
+    public bool ShouldShowFloat => CodexWindowHandle == IntPtr.Zero ||
+                                   (NativeMethods.IsWindowVisible(CodexWindowHandle) && !NativeMethods.IsIconic(CodexWindowHandle));
+}
+
+internal sealed record QuotaWindow(string Label, double RemainingPercent, DateTimeOffset? ResetsAt, long WindowSeconds = 0);
 
 internal sealed record QuotaSnapshot(string Plan, IReadOnlyList<QuotaWindow> Windows, string CreditText, DateTimeOffset FetchedAt)
 {
@@ -429,7 +682,7 @@ internal static class QuotaParser
             TryGetDouble(individual, "remaining_percent", out var spendRemaining))
         {
             var reset = TryGetLong(individual, "reset_at", out var resetAt) ? SafeUnixTime(resetAt) : null;
-            windows.Add(new QuotaWindow("月度使用上限", Math.Clamp(spendRemaining, 0, 100), reset));
+            windows.Add(new QuotaWindow("月度使用上限", Math.Clamp(spendRemaining, 0, 100), reset, 30 * 24 * 60 * 60));
         }
 
         var creditText = "未启用加购额度";
@@ -455,7 +708,7 @@ internal static class QuotaParser
         var seconds = TryGetLong(window, "limit_window_seconds", out var rawSeconds) ? rawSeconds : 0;
         var label = string.IsNullOrWhiteSpace(prefix) ? FriendlyDuration(seconds) : prefix!;
         var reset = TryGetLong(window, "reset_at", out var resetAt) ? SafeUnixTime(resetAt) : null;
-        output.Add(new QuotaWindow(label, Math.Clamp(100 - used, 0, 100), reset));
+        output.Add(new QuotaWindow(label, Math.Clamp(100 - used, 0, 100), reset, seconds));
     }
 
     private static string FriendlyDuration(long seconds)
@@ -529,6 +782,9 @@ internal sealed class QuotaForm : Form
     private readonly Font _labelFont = new("Microsoft YaHei UI", 8.6f);
     private readonly Font _valueFont = new("Segoe UI Semibold", 17f);
     private readonly Font _smallFont = new("Microsoft YaHei UI", 7.5f);
+    private readonly Font _skillTitleFont = new("Microsoft YaHei UI", 9f, FontStyle.Bold);
+    private readonly Font _skillNameFont = new("Segoe UI Semibold", 8.6f);
+    private readonly Font _skillDescriptionFont = new("Microsoft YaHei UI", 7.3f);
     private readonly System.Windows.Forms.Timer _clockTimer = new() { Interval = 1000 };
     private QuotaSnapshot? _snapshot;
     private string _message = "等待 Codex 启动…";
@@ -536,24 +792,37 @@ internal sealed class QuotaForm : Form
     private bool _dragging;
     private bool _dragMoved;
     private bool _layerTogglePressed;
+    private bool _skinButtonPressed;
+    private bool _skinActive;
+    private bool _skinBusy;
+    private string _skinLabel = "启用皮肤";
     private bool _alwaysOnTop;
+    private bool _skillsExpanded;
+    private bool _skillsTogglePressed;
+    private bool _skillsLoading;
+    private int _skillScrollIndex;
+    private SkillCatalogSnapshot _skillCatalog = new(DateTime.MinValue, Array.Empty<CodexSkill>());
     private bool _savedPositionLoaded;
     private IntPtr _codexOwner;
     private Point _dragStartCursor;
     private Point _dragStartWindow;
 
     public event EventHandler? RefreshRequested;
+    public event EventHandler? SkinActionRequested;
+    public event EventHandler? SkillsToggleRequested;
     public event EventHandler? MenuRequested;
     public event Action<bool>? AlwaysOnTopChanged;
     [System.ComponentModel.Browsable(false)]
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     internal bool UserPositioned { get; private set; }
+    internal bool SkillsExpanded => _skillsExpanded;
 
     public QuotaForm()
     {
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = Color.FromArgb(227, 232, 226);
         ClientSize = new Size(342, 230);
+        Text = "Codex 额度悬浮窗";
         FormBorderStyle = FormBorderStyle.None;
         MaximizeBox = false;
         MinimizeBox = false;
@@ -613,10 +882,57 @@ internal sealed class QuotaForm : Form
         Invalidate();
     }
 
+    public bool ToggleSkillsPanel()
+    {
+        SetSkillsExpanded(!_skillsExpanded);
+        return _skillsExpanded;
+    }
+
+    public void SetSkillsExpanded(bool expanded)
+    {
+        if (_skillsExpanded == expanded)
+        {
+            return;
+        }
+
+        _skillsExpanded = expanded;
+        _skillScrollIndex = 0;
+        UpdateHeight();
+        SaveSettings();
+        Invalidate();
+    }
+
+    public void SetSkillsLoading(bool loading)
+    {
+        if (_skillsLoading == loading)
+        {
+            return;
+        }
+
+        _skillsLoading = loading;
+        Invalidate(SkillPanelRect);
+    }
+
+    public void SetSkillCatalog(SkillCatalogSnapshot catalog)
+    {
+        _skillCatalog = catalog;
+        _skillScrollIndex = Math.Min(_skillScrollIndex, MaxSkillScrollIndex);
+        Invalidate(SkillPanelRect);
+    }
+
     public void SetError(string error)
     {
         _error = error;
         Invalidate();
+    }
+
+    public void SetSkinState(string label, bool active, bool busy)
+    {
+        if (_skinLabel == label && _skinActive == active && _skinBusy == busy) return;
+        _skinLabel = label;
+        _skinActive = active;
+        _skinBusy = busy;
+        Invalidate(SkinButtonRect);
     }
 
     public void SetAlwaysOnTop(bool enabled)
@@ -677,11 +993,28 @@ internal sealed class QuotaForm : Form
     }
 
     private Rectangle LayerToggleRect => new(Width - 69, Height - 82, 42, 60);
+    private Rectangle SkinButtonRect => new(Width - 150, Height - 35, 62, 22);
+    private Rectangle SkillsToggleRect => new(Width - 69, 112, 42, 22);
+    private Rectangle SkillPanelRect
+    {
+        get
+        {
+            var count = Math.Max(1, _snapshot?.Windows.Count ?? 0);
+            var top = 132 + Math.Min(3, count) * 64 + 2;
+            return new Rectangle(22, top, Width - 116, Math.Max(0, Height - top - 52));
+        }
+    }
+
+    private int VisibleSkillRows => Math.Max(1, (SkillPanelRect.Height - 42) / 44);
+    private int MaxSkillScrollIndex => Math.Max(0, _skillCatalog.Skills.Count - VisibleSkillRows);
 
     private void UpdateHeight()
     {
         var count = Math.Max(1, _snapshot?.Windows.Count ?? 0);
-        Height = 180 + Math.Min(3, count) * 64;
+        var compactHeight = 180 + Math.Min(3, count) * 64;
+        ClientSize = _skillsExpanded
+            ? new Size(564, Math.Max(620, compactHeight + 370))
+            : new Size(342, compactHeight);
         if (UserPositioned) Location = ClampToScreen(Location);
         UpdateRegion();
     }
@@ -704,6 +1037,20 @@ internal sealed class QuotaForm : Form
     {
         base.OnMouseDown(e);
         if (e.Button != MouseButtons.Left) return;
+        if (SkillsToggleRect.Contains(e.Location))
+        {
+            _skillsTogglePressed = true;
+            Capture = true;
+            Invalidate(SkillsToggleRect);
+            return;
+        }
+        if (SkinButtonRect.Contains(e.Location) && !_skinBusy)
+        {
+            _skinButtonPressed = true;
+            Capture = true;
+            Invalidate(SkinButtonRect);
+            return;
+        }
         if (LayerToggleRect.Contains(e.Location))
         {
             _layerTogglePressed = true;
@@ -723,8 +1070,12 @@ internal sealed class QuotaForm : Form
         base.OnMouseMove(e);
         if (!_dragging)
         {
-            Cursor = LayerToggleRect.Contains(e.Location) ? Cursors.Hand : Cursors.SizeAll;
+            var overAction = LayerToggleRect.Contains(e.Location)
+                || SkillsToggleRect.Contains(e.Location)
+                || (SkinButtonRect.Contains(e.Location) && !_skinBusy);
+            Cursor = overAction ? Cursors.Hand : Cursors.SizeAll;
         }
+        if (_skinButtonPressed) return;
         if (_layerTogglePressed) return;
         if (!_dragging) return;
         var deltaX = Cursor.Position.X - _dragStartCursor.X;
@@ -739,6 +1090,29 @@ internal sealed class QuotaForm : Form
         if (e.Button == MouseButtons.Right)
         {
             MenuRequested?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+        if (e.Button == MouseButtons.Left && _skinButtonPressed)
+        {
+            _skinButtonPressed = false;
+            Capture = false;
+            if (SkinButtonRect.Contains(e.Location) && !_skinBusy)
+            {
+                SkinActionRequested?.Invoke(this, EventArgs.Empty);
+            }
+            Invalidate(SkinButtonRect);
+            return;
+        }
+        if (e.Button == MouseButtons.Left && _skillsTogglePressed)
+        {
+            _skillsTogglePressed = false;
+            Capture = false;
+            if (SkillsToggleRect.Contains(e.Location))
+            {
+                SkillsToggleRequested?.Invoke(this, EventArgs.Empty);
+            }
+
+            Invalidate(SkillsToggleRect);
             return;
         }
         if (e.Button == MouseButtons.Left && _layerTogglePressed)
@@ -764,8 +1138,21 @@ internal sealed class QuotaForm : Form
     protected override void OnMouseDoubleClick(MouseEventArgs e)
     {
         base.OnMouseDoubleClick(e);
-        if (LayerToggleRect.Contains(e.Location)) return;
+        if (LayerToggleRect.Contains(e.Location) || SkinButtonRect.Contains(e.Location) || SkillsToggleRect.Contains(e.Location)) return;
         if (!_dragMoved) RefreshRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        base.OnMouseWheel(e);
+        if (!_skillsExpanded || !SkillPanelRect.Contains(e.Location) || _skillCatalog.Skills.Count == 0)
+        {
+            return;
+        }
+
+        var next = _skillScrollIndex - Math.Sign(e.Delta) * 3;
+        _skillScrollIndex = Math.Clamp(next, 0, MaxSkillScrollIndex);
+        Invalidate(SkillPanelRect);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -792,6 +1179,11 @@ internal sealed class QuotaForm : Form
                 DrawQuotaWindow(g, window, y);
                 y += 64;
             }
+        }
+
+        if (_skillsExpanded)
+        {
+            DrawSkillsPanel(g);
         }
 
         DrawFooter(g);
@@ -839,17 +1231,37 @@ internal sealed class QuotaForm : Form
     private void DrawVerticalTitle(Graphics g)
     {
         var x = Width - 48;
-        var y = 28;
+        var y = 42;
         using var ink = new SolidBrush(Color.FromArgb(52, 54, 49));
         using var format = new StringFormat { Alignment = StringAlignment.Center };
-        foreach (var character in "额度余量")
+        foreach (var character in "额度")
         {
             g.DrawString(character.ToString(), _verticalFont, ink, new RectangleF(x - 14, y, 28, 25), format);
             y += 27;
         }
         using var seal = new SolidBrush(Color.FromArgb(176, 66, 53));
-        g.FillEllipse(seal, x - 3, y + 8, 6, 6);
+        g.FillEllipse(seal, x - 3, y + 5, 6, 6);
+        DrawSkillsToggle(g);
         DrawLayerToggle(g);
+    }
+
+    private void DrawSkillsToggle(Graphics g)
+    {
+        var rect = SkillsToggleRect;
+        var fillColor = _skillsExpanded ? Color.FromArgb(100, 117, 104) : Color.FromArgb(244, 238, 221);
+        if (_skillsTogglePressed)
+        {
+            fillColor = _skillsExpanded ? Color.FromArgb(84, 100, 90) : Color.FromArgb(231, 218, 187);
+        }
+
+        using var path = RoundedRect(rect, 9);
+        using var fill = new SolidBrush(fillColor);
+        using var border = new Pen(_skillsExpanded ? Color.FromArgb(77, 99, 82) : Color.FromArgb(191, 165, 107));
+        using var text = new SolidBrush(_skillsExpanded ? Color.FromArgb(255, 253, 246) : Color.FromArgb(104, 79, 39));
+        using var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+        g.FillPath(fill, path);
+        g.DrawPath(border, path);
+        g.DrawString(_skillsExpanded ? "收起" : "技能", _smallFont, text, rect, format);
     }
 
     private void DrawLayerToggle(Graphics g)
@@ -911,6 +1323,80 @@ internal sealed class QuotaForm : Form
         g.DrawString(resetText, _smallFont, resetBrush, 22, y + 41);
     }
 
+    private void DrawSkillsPanel(Graphics g)
+    {
+        var panel = SkillPanelRect;
+        if (panel.Height <= 0)
+        {
+            return;
+        }
+
+        using var panelPath = RoundedRect(panel, 11);
+        using var panelFill = new SolidBrush(Color.FromArgb(244, 246, 239));
+        using var panelBorder = new Pen(Color.FromArgb(210, 216, 205));
+        using var titleBrush = new SolidBrush(Color.FromArgb(64, 76, 64));
+        using var mutedBrush = new SolidBrush(Color.FromArgb(119, 124, 114));
+        g.FillPath(panelFill, panelPath);
+        g.DrawPath(panelBorder, panelPath);
+
+        g.DrawString("最近安装的 Skills", _skillTitleFont, titleBrush, panel.X + 12, panel.Y + 9);
+        var status = _skillsLoading
+            ? "扫描中…"
+            : _skillCatalog.RefreshedAt == DateTime.MinValue
+                ? "点击刷新"
+                : $"{_skillCatalog.Skills.Count} 项 · {_skillCatalog.RefreshedAt:HH:mm}";
+        using var statusFormat = new StringFormat { Alignment = StringAlignment.Far };
+        g.DrawString(status, _smallFont, mutedBrush, new RectangleF(panel.X + 110, panel.Y + 12, panel.Width - 122, 18), statusFormat);
+
+        var rowTop = panel.Y + 33;
+        if (_skillsLoading)
+        {
+            g.DrawString("正在读取本机已安装的个人、插件和系统 Skills…", _skillDescriptionFont, mutedBrush,
+                new RectangleF(panel.X + 12, rowTop + 8, panel.Width - 24, 34));
+            return;
+        }
+
+        if (_skillCatalog.Skills.Count == 0)
+        {
+            g.DrawString("未发现可显示的 Skills；可在托盘菜单中再次刷新。", _skillDescriptionFont, mutedBrush,
+                new RectangleF(panel.X + 12, rowTop + 8, panel.Width - 24, 34));
+            return;
+        }
+
+        var skills = _skillCatalog.Skills;
+        var visible = Math.Min(VisibleSkillRows, skills.Count - _skillScrollIndex);
+        using var descriptionFormat = new StringFormat(StringFormatFlags.LineLimit)
+        {
+            Trimming = StringTrimming.EllipsisCharacter
+        };
+        for (var row = 0; row < visible; row++)
+        {
+            var skill = skills[_skillScrollIndex + row];
+            var y = rowTop + row * 44;
+            if (row > 0)
+            {
+                using var divider = new Pen(Color.FromArgb(223, 226, 217));
+                g.DrawLine(divider, panel.X + 10, y - 3, panel.Right - 10, y - 3);
+            }
+
+            using var nameBrush = new SolidBrush(Color.FromArgb(55, 60, 54));
+            using var sourceBrush = new SolidBrush(skill.Source == "插件" ? Color.FromArgb(91, 116, 138) : Color.FromArgb(108, 120, 89));
+            g.DrawString(skill.Name, _skillNameFont, nameBrush, panel.X + 12, y + 2);
+            g.DrawString($"{skill.Source} · {skill.InstalledAt:MM-dd}", _smallFont, sourceBrush,
+                new RectangleF(panel.Right - 88, y + 4, 76, 15), statusFormat);
+            g.DrawString(skill.Description, _skillDescriptionFont, mutedBrush,
+                new RectangleF(panel.X + 12, y + 19, panel.Width - 24, 19), descriptionFormat);
+        }
+
+        if (MaxSkillScrollIndex > 0)
+        {
+            var thumbHeight = Math.Max(16, (int)Math.Round((double)(panel.Height - 41) * VisibleSkillRows / skills.Count));
+            var thumbTop = rowTop + (int)Math.Round((double)(panel.Height - 41 - thumbHeight) * _skillScrollIndex / MaxSkillScrollIndex);
+            using var scrollBrush = new SolidBrush(Color.FromArgb(164, 176, 158));
+            g.FillRectangle(scrollBrush, panel.Right - 7, thumbTop, 3, thumbHeight);
+        }
+    }
+
     private void DrawFooter(Graphics g)
     {
         var left = _snapshot?.CreditText ?? "每 30 秒自动更新";
@@ -919,11 +1405,47 @@ internal sealed class QuotaForm : Form
         using var linePen = new Pen(Color.FromArgb(222, 216, 203));
         g.DrawLine(linePen, 22, Height - 40, Width - 94, Height - 40);
         using var footerBrush = new SolidBrush(_error is null ? Color.FromArgb(126, 122, 112) : Color.FromArgb(176, 86, 53));
-        g.DrawString(left, _smallFont, footerBrush, 22, Height - 31);
+        g.DrawString(left, _smallFont, footerBrush, new RectangleF(22, Height - 31, SkinButtonRect.X - 30, 20));
 
-        const string action = "双击刷新";
-        var size = g.MeasureString(action, _smallFont);
-        g.DrawString(action, _smallFont, footerBrush, Width - 94 - size.Width, Height - 31);
+        DrawSkinButton(g);
+    }
+
+    private void DrawSkinButton(Graphics g)
+    {
+        var rect = SkinButtonRect;
+        var fillColor = _skinBusy
+            ? Color.FromArgb(226, 223, 214)
+            : _skinActive
+                ? Color.FromArgb(105, 126, 107)
+                : Color.FromArgb(236, 225, 199);
+        if (_skinButtonPressed && !_skinBusy)
+        {
+            fillColor = _skinActive
+                ? Color.FromArgb(85, 106, 89)
+                : Color.FromArgb(222, 207, 172);
+        }
+
+        var borderColor = _skinActive
+            ? Color.FromArgb(79, 103, 84)
+            : Color.FromArgb(188, 158, 98);
+        var textColor = _skinBusy
+            ? Color.FromArgb(137, 133, 123)
+            : _skinActive
+                ? Color.FromArgb(255, 253, 246)
+                : Color.FromArgb(100, 79, 42);
+
+        using var path = RoundedRect(rect, 10);
+        using var fill = new SolidBrush(fillColor);
+        using var border = new Pen(borderColor);
+        using var text = new SolidBrush(textColor);
+        using var format = new StringFormat
+        {
+            Alignment = StringAlignment.Center,
+            LineAlignment = StringAlignment.Center
+        };
+        g.FillPath(fill, path);
+        g.DrawPath(border, path);
+        g.DrawString(_skinLabel, _smallFont, text, rect, format);
     }
 
     private void LoadSavedPosition()
@@ -949,6 +1471,8 @@ internal sealed class QuotaForm : Form
 
             var alwaysOnTop = root.TryGetProperty("alwaysOnTop", out var topValue) && topValue.ValueKind == JsonValueKind.True;
             ApplyAlwaysOnTop(alwaysOnTop, persist: false);
+            _skillsExpanded = root.TryGetProperty("skillsExpanded", out var expandedValue) && expandedValue.ValueKind == JsonValueKind.True;
+            UpdateHeight();
         }
         catch
         {
@@ -968,7 +1492,8 @@ internal sealed class QuotaForm : Form
                 x = Left,
                 y = Top,
                 hasPosition = UserPositioned,
-                alwaysOnTop = _alwaysOnTop
+                alwaysOnTop = _alwaysOnTop,
+                skillsExpanded = _skillsExpanded
             }));
         }
         catch { }
@@ -1006,6 +1531,9 @@ internal sealed class QuotaForm : Form
             _labelFont.Dispose();
             _valueFont.Dispose();
             _smallFont.Dispose();
+            _skillTitleFont.Dispose();
+            _skillNameFont.Dispose();
+            _skillDescriptionFont.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -1169,6 +1697,14 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool IsIconic(IntPtr hWnd);
 
     internal static IntPtr SetWindowOwner(IntPtr windowHandle, IntPtr ownerHandle)
     {
